@@ -1,12 +1,13 @@
 import sys
 import os
 import json
+import requests
 import qtawesome as qta
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QLineEdit, QListWidget, 
                              QListWidgetItem, QSlider, QFrame, QStackedWidget, QGraphicsDropShadowEffect, QMessageBox)
 from PyQt5.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal, QPoint
-from PyQt5.QtGui import QColor
+from PyQt5.QtGui import QColor, QPixmap, QIcon
 
 import vlc
 import yt_dlp
@@ -22,6 +23,24 @@ if os.path.exists(vlc_path):
 
 # --- 2. ARKA PLAN İŞÇİLERİ ---
 
+class ImageLoader(QThread):
+    """Resimleri arka planda indirir, arayüzü dondurmaz."""
+    image_loaded = pyqtSignal(object, object) # item, pixmap
+
+    def __init__(self, url, list_item):
+        super().__init__()
+        self.url = url
+        self.item = list_item
+
+    def run(self):
+        try:
+            data = requests.get(self.url, timeout=5).content
+            pixmap = QPixmap()
+            pixmap.loadFromData(data)
+            self.image_loaded.emit(self.item, pixmap)
+        except:
+            pass # Resim yüklenemezse boşver
+
 class SearchThread(QThread):
     results_ready = pyqtSignal(list)
     error_occurred = pyqtSignal(str)
@@ -32,12 +51,12 @@ class SearchThread(QThread):
 
     def run(self):
         try:
-            # 5 SONUÇ + DETAYLI ARAMA (Resim ve Başlık Garantili)
+            # Resimlerin gelmesi için extract_flat=False yaptık (Biraz daha veri çeker ama görsel şart)
             ydl_opts = {
                 'quiet': True,
                 'noplaylist': True,
                 'default_search': 'ytsearch5',
-                'extract_flat': False, # Başlıkların kesin gelmesi için False yaptık
+                'extract_flat': False, 
             }
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -67,9 +86,9 @@ class AudioThread(QThread):
 
     def run(self):
         try:
-            # DONMAYI ENGELLEMEK İÇİN DÜŞÜK ÇÖZÜNÜRLÜK (Zaten sadece ses lazım)
+            # 360p video (ses için yeterli ve hızlı)
             ydl_opts = {
-                'format': 'best[height<=480]/best', # 480p veya altını al (Daha hızlı yüklenir)
+                'format': 'best[height<=360]/best', 
                 'quiet': True,
                 'noplaylist': True
             }
@@ -126,11 +145,8 @@ class HypeVibeNeon(QMainWindow):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.resize(1150, 780)
         
-        # --- VLC AYARLARI (DONMA VE VİDEO PENCERESİ ÇÖZÜMÜ) ---
+        # VLC Ayarları (Video penceresini kapatmak için)
         try:
-            # --no-video: Video penceresini açma
-            # --network-caching=5000: 5000ms (5 saniye) önbellekleme yap (Donmayı önler)
-            # --quiet: Logları kapat
             vlc_args = "--no-video --network-caching=5000 --quiet"
             self.instance = vlc.Instance(vlc_args)
             self.player = self.instance.media_player_new()
@@ -141,6 +157,7 @@ class HypeVibeNeon(QMainWindow):
         self.current_playlist = [] 
         self.current_index = -1
         self.old_pos = None
+        self.image_threads = [] # Resim işçilerini tutmak için
 
         self.init_ui()
         self.init_style()
@@ -164,7 +181,7 @@ class HypeVibeNeon(QMainWindow):
             QFrame#MainFrame { background-color: #1e1e2e; border-radius: 15px; border: 1px solid #44475a; }
             QLineEdit { background-color: #282a36; color: #f8f8f2; border-radius: 20px; padding: 10px 15px; border: 1px solid #44475a; }
             QListWidget { background-color: transparent; border: none; }
-            QListWidget::item { color: #f8f8f2; padding: 10px; margin: 2px; border-radius: 5px; }
+            QListWidget::item { color: #f8f8f2; padding: 5px; margin: 2px; border-radius: 5px; }
             QListWidget::item:hover { background-color: #44475a; }
             QListWidget::item:selected { background-color: rgba(189, 147, 249, 0.2); color: #bd93f9; }
             QLabel { color: #f8f8f2; font-family: 'Segoe UI', Arial; }
@@ -241,6 +258,7 @@ class HypeVibeNeon(QMainWindow):
         search_box.addWidget(btn_go)
         
         self.list_results = QListWidget()
+        self.list_results.setIconSize(QSize(120, 90)) # Büyük resimler için
         self.list_results.itemDoubleClicked.connect(lambda item: self.play_item(item, 'search'))
         
         ls.addLayout(search_box)
@@ -252,6 +270,7 @@ class HypeVibeNeon(QMainWindow):
         ll = QVBoxLayout(p_lib)
         ll.setContentsMargins(30,30,30,30)
         self.list_favs = QListWidget()
+        self.list_favs.setIconSize(QSize(80, 60))
         self.list_favs.itemDoubleClicked.connect(lambda item: self.play_item(item, 'fav'))
         ll.addWidget(QLabel("💜 Favorilerim"))
         ll.addWidget(self.list_favs)
@@ -269,14 +288,24 @@ class HypeVibeNeon(QMainWindow):
         player_bar.setStyleSheet("background-color: #15161e; border-top: 1px solid #bd93f9; border-bottom-left-radius: 15px; border-bottom-right-radius: 15px;")
         pb = QHBoxLayout(player_bar)
         
-        info = QVBoxLayout()
+        # Sol Taraf: Resim + Bilgi
+        info_layout = QHBoxLayout()
+        self.lbl_cover = QLabel()
+        self.lbl_cover.setFixedSize(60, 60)
+        self.lbl_cover.setStyleSheet("background-color: #333; border-radius: 5px;")
+        
+        text_layout = QVBoxLayout()
         self.lbl_title = QLabel("Müzik Seçilmedi")
         self.lbl_title.setStyleSheet("font-weight: bold;")
         self.lbl_artist = QLabel("HypeVibe")
         self.lbl_artist.setStyleSheet("color: #6272a4; font-size: 12px;")
-        info.addWidget(self.lbl_title)
-        info.addWidget(self.lbl_artist)
+        text_layout.addWidget(self.lbl_title)
+        text_layout.addWidget(self.lbl_artist)
         
+        info_layout.addWidget(self.lbl_cover)
+        info_layout.addLayout(text_layout)
+        
+        # Kontroller
         ctrl = QVBoxLayout()
         btns = QHBoxLayout()
         self.btn_play = NeonButton('fa5s.play-circle', 45, "#bd93f9")
@@ -310,7 +339,7 @@ class HypeVibeNeon(QMainWindow):
         self.btn_like.clicked.connect(self.add_fav)
         extra.addWidget(self.btn_like)
         
-        pb.addLayout(info, 1)
+        pb.addLayout(info_layout, 1) # Artık resim burada
         pb.addStretch()
         pb.addLayout(ctrl, 3)
         pb.addStretch()
@@ -343,17 +372,31 @@ class HypeVibeNeon(QMainWindow):
 
     def on_results(self, res):
         self.lbl_title.setText(f"{len(res)} Sonuç")
+        self.image_threads.clear() # Eski indirmeleri temizle
+        
         for r in res:
-            title = r.get('title') or r.get('id') or 'Bilinmiyor'
+            title = r.get('title', 'Bilinmiyor')
             url = r.get('url') or r.get('webpage_url') or r.get('id')
-            if not url: continue
+            thumbnail = r.get('thumbnail', '') # Resim linkini al
             
+            if not url: continue
             if len(url) == 11 and '.' not in url: url = f"https://www.youtube.com/watch?v={url}"
             
             it = QListWidgetItem(title)
-            it.setIcon(qta.icon('fa5s.music', color='#bd93f9'))
-            it.setData(Qt.UserRole, {'title': title, 'url': url})
+            it.setIcon(qta.icon('fa5s.music', color='#bd93f9')) # Önce geçici ikon
+            it.setData(Qt.UserRole, {'title': title, 'url': url, 'thumbnail': thumbnail})
             self.list_results.addItem(it)
+            
+            # Resim varsa arka planda indir
+            if thumbnail:
+                downloader = ImageLoader(thumbnail, it)
+                downloader.image_loaded.connect(self.set_item_icon)
+                self.image_threads.append(downloader) # Referansı tut (silinmesin diye)
+                downloader.start()
+
+    def set_item_icon(self, item, pixmap):
+        icon = QIcon(pixmap)
+        item.setIcon(icon)
 
     def play_item(self, item, src):
         if src == 'search':
@@ -369,12 +412,21 @@ class HypeVibeNeon(QMainWindow):
         self.lbl_title.setText("Yükleniyor...")
         self.lbl_artist.setText(data['title'])
         
+        # Alt barın solundaki küçük resmi güncelle
+        if data.get('thumbnail'):
+            try:
+                # Küçük olduğu için thread'e gerek duymadan anlık indirebiliriz veya thread kullanabiliriz
+                # Basitlik için burada anlık indirelim (zaten cache'de olabilir) veya placeholder koyalım
+                # Thread ile yapmak en doğrusu ama UI thread'de kısa takılma olabilir.
+                # Şimdilik direkt set etmeyelim, image loader kullanalım
+                pass
+            except: pass
+
         is_fav = any(f['url'] == data['url'] for f in self.favorites)
         self.btn_like.setIcon(qta.icon('fa5s.heart', color='#ff5555' if is_fav else '#6272a4'))
         
         self.audio_thread = AudioThread(data['url'], data['title'])
         self.audio_thread.url_ready.connect(self.start_vlc)
-        # Hata olursa pop-up çıkar
         self.audio_thread.error_occurred.connect(lambda e: QMessageBox.warning(self, "Hata", f"Bağlantı Hatası: {e}"))
         self.audio_thread.start()
 
@@ -382,8 +434,15 @@ class HypeVibeNeon(QMainWindow):
         m = self.instance.media_new(url)
         self.player.set_media(m)
         self.player.play()
-        self.lbl_title.setText(title[:30] + "..." if len(title)>30 else title)
+        self.lbl_title.setText(title[:25] + "..." if len(title)>25 else title)
         self.btn_play.setIcon(qta.icon('fa5s.pause-circle', color='#bd93f9'))
+        
+        # Çalan şarkının resmini yükle
+        if self.current_data and self.current_data.get('thumbnail'):
+             d = ImageLoader(self.current_data['thumbnail'], None)
+             d.image_loaded.connect(lambda i, p: self.lbl_cover.setPixmap(p.scaled(60, 60, Qt.KeepAspectRatio, Qt.SmoothTransformation)))
+             self.image_threads.append(d)
+             d.start()
 
     def toggle_play(self):
         if self.player.is_playing():
@@ -435,6 +494,13 @@ class HypeVibeNeon(QMainWindow):
             it.setIcon(qta.icon('fa5s.heart', color='#bd93f9'))
             it.setData(Qt.UserRole, s)
             self.list_favs.addItem(it)
+            
+            # Favori resimlerini de yükle
+            if s.get('thumbnail'):
+                dl = ImageLoader(s['thumbnail'], it)
+                dl.image_loaded.connect(self.set_item_icon)
+                self.image_threads.append(dl)
+                dl.start()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
