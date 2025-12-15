@@ -1,254 +1,443 @@
 import sys
 import os
-import requests
-import time
+import json
+import qtawesome as qta
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                             QHBoxLayout, QPushButton, QLabel, QLineEdit, QListWidget, 
+                             QListWidgetItem, QSlider, QFrame, QStackedWidget, QGraphicsDropShadowEffect, QMessageBox)
+from PyQt5.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal, QPoint
+from PyQt5.QtGui import QColor
 
-# --- YAMALAR ---
+import vlc
+import yt_dlp
 import PyQt5
-qt5_dirname = os.path.dirname(PyQt5.__file__)
-plugin_path = os.path.join(qt5_dirname, 'Qt5', 'plugins')
-os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = plugin_path
 
+# --- 1. AYARLAR ---
+os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = os.path.join(os.path.dirname(PyQt5.__file__), 'Qt5', 'plugins')
+
+# VLC Yolu
 vlc_path = r"C:\Program Files\VideoLAN\VLC"
 if os.path.exists(vlc_path):
     os.add_dll_directory(vlc_path)
 
-import vlc
-import yt_dlp
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QPushButton, QLabel, QLineEdit, QListWidget, 
-                             QListWidgetItem, QSlider, QMessageBox)
-from PyQt5.QtCore import Qt, QSize, QTimer
-from PyQt5.QtGui import QPixmap, QIcon
+# --- 2. ARKA PLAN İŞÇİLERİ ---
 
-class HypeVibePlayer(QMainWindow):
+class SearchThread(QThread):
+    results_ready = pyqtSignal(list)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, query):
+        super().__init__()
+        self.query = query
+
+    def run(self):
+        try:
+            # 5 SONUÇ + DETAYLI ARAMA (Resim ve Başlık Garantili)
+            ydl_opts = {
+                'quiet': True,
+                'noplaylist': True,
+                'default_search': 'ytsearch5',
+                'extract_flat': False, # Başlıkların kesin gelmesi için False yaptık
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(self.query, download=False)
+                
+                if 'entries' in info:
+                    results = info['entries']
+                else:
+                    results = [info]
+                
+                if not results:
+                    self.error_occurred.emit("Sonuç bulunamadı.")
+                else:
+                    self.results_ready.emit(results)
+                    
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+
+class AudioThread(QThread):
+    url_ready = pyqtSignal(str, str)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, video_url, title):
+        super().__init__()
+        self.url = video_url
+        self.title = title
+
+    def run(self):
+        try:
+            # DONMAYI ENGELLEMEK İÇİN DÜŞÜK ÇÖZÜNÜRLÜK (Zaten sadece ses lazım)
+            ydl_opts = {
+                'format': 'best[height<=480]/best', # 480p veya altını al (Daha hızlı yüklenir)
+                'quiet': True,
+                'noplaylist': True
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(self.url, download=False)
+                self.url_ready.emit(info['url'], self.title)
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+
+# --- 3. TASARIM BİLEŞENLERİ ---
+
+class NeonButton(QPushButton):
+    def __init__(self, icon_name, size=24, color="#bd93f9", parent=None):
+        super().__init__(parent)
+        self.setIcon(qta.icon(icon_name, color=color))
+        self.setIconSize(QSize(size, size))
+        self.setCursor(Qt.PointingHandCursor)
+        self.setStyleSheet("""
+            QPushButton { background: transparent; border: none; } 
+            QPushButton:hover { background-color: rgba(189, 147, 249, 0.1); border-radius: 15px; }
+            QPushButton:pressed { background-color: rgba(189, 147, 249, 0.2); }
+        """)
+
+class SidebarButton(QPushButton):
+    def __init__(self, text, icon_name, parent=None):
+        super().__init__(parent)
+        self.setText(text)
+        self.setIcon(qta.icon(icon_name, color="#e0e0e0"))
+        self.setIconSize(QSize(20, 20))
+        self.setCursor(Qt.PointingHandCursor)
+        self.setStyleSheet("""
+            QPushButton {
+                background-color: transparent; 
+                color: #e0e0e0; 
+                text-align: left; 
+                padding: 15px 20px; 
+                font-size: 14px; 
+                font-family: 'Segoe UI', Arial; 
+                border: none;
+            }
+            QPushButton:hover { 
+                background-color: #2a2a3e; 
+                color: #bd93f9; 
+                border-left: 4px solid #bd93f9;
+            }
+        """)
+
+# --- 4. ANA UYGULAMA ---
+
+class HypeVibeNeon(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("HypeVibe Player - Pro")
-        self.setGeometry(100, 100, 950, 650)
+        self.setWindowFlags(Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.resize(1150, 780)
         
-        # VLC ve Zamanlayıcı
-        self.instance = vlc.Instance()
-        self.player = self.instance.media_player_new()
-        self.timer = QTimer(self)
-        self.timer.setInterval(1000) # Her 1 saniyede bir güncelle
-        self.timer.timeout.connect(self.update_ui)
-        
-        self.init_ui()
-        self.set_style()
-        self.search_results = []
-        self.is_dragging = False # Kullanıcı çubuğu tutuyor mu?
+        # --- VLC AYARLARI (DONMA VE VİDEO PENCERESİ ÇÖZÜMÜ) ---
+        try:
+            # --no-video: Video penceresini açma
+            # --network-caching=5000: 5000ms (5 saniye) önbellekleme yap (Donmayı önler)
+            # --quiet: Logları kapat
+            vlc_args = "--no-video --network-caching=5000 --quiet"
+            self.instance = vlc.Instance(vlc_args)
+            self.player = self.instance.media_player_new()
+        except:
+            pass
 
-    def set_style(self):
+        self.favorites = self.load_favs()
+        self.current_playlist = [] 
+        self.current_index = -1
+        self.old_pos = None
+
+        self.init_ui()
+        self.init_style()
+        
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_slider)
+        self.timer.start(1000)
+
+    def load_favs(self):
+        if os.path.exists("favs.json"):
+            try: 
+                with open("favs.json", "r", encoding="utf-8") as f: 
+                    return json.load(f)
+            except: 
+                return []
+        return []
+
+    def init_style(self):
         self.setStyleSheet("""
-            QMainWindow { background-color: #121212; }
-            QLabel { color: white; font-family: Arial; }
-            QPushButton { 
-                background-color: #1DB954; color: white; border-radius: 15px; 
-                padding: 8px; font-weight: bold; font-size: 12px;
-            }
-            QPushButton:hover { background-color: #1ed760; }
-            QLineEdit { 
-                padding: 10px; border-radius: 20px; border: 1px solid #333;
-                background-color: #282828; color: white; font-size: 14px;
-            }
-            QListWidget { 
-                background-color: #121212; color: white; border: none; font-size: 14px;
-            }
-            QListWidget::item { padding: 10px; border-bottom: 1px solid #282828; }
-            QListWidget::item:selected { background-color: #282828; color: #1DB954; }
-            QSlider::groove:horizontal {
-                height: 8px; background: #535353; border-radius: 4px;
-            }
-            QSlider::handle:horizontal {
-                background: white; width: 14px; margin: -3px 0; border-radius: 7px;
-            }
-            QSlider::sub-page:horizontal { background: #1DB954; border-radius: 4px; }
+            QMainWindow { background-color: transparent; }
+            QFrame#MainFrame { background-color: #1e1e2e; border-radius: 15px; border: 1px solid #44475a; }
+            QLineEdit { background-color: #282a36; color: #f8f8f2; border-radius: 20px; padding: 10px 15px; border: 1px solid #44475a; }
+            QListWidget { background-color: transparent; border: none; }
+            QListWidget::item { color: #f8f8f2; padding: 10px; margin: 2px; border-radius: 5px; }
+            QListWidget::item:hover { background-color: #44475a; }
+            QListWidget::item:selected { background-color: rgba(189, 147, 249, 0.2); color: #bd93f9; }
+            QLabel { color: #f8f8f2; font-family: 'Segoe UI', Arial; }
+            QSlider::groove:horizontal { height: 6px; background: #44475a; border-radius: 3px; }
+            QSlider::handle:horizontal { background: #bd93f9; width: 14px; margin: -4px 0; border-radius: 7px; }
+            QSlider::sub-page:horizontal { background: #bd93f9; border-radius: 3px; }
         """)
 
     def init_ui(self):
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout()
-        central_widget.setLayout(main_layout)
+        self.main_frame = QFrame(self)
+        self.main_frame.setObjectName("MainFrame")
+        self.main_frame.setGeometry(0, 0, 1150, 780)
         
-        # --- 1. ARAMA ---
-        search_layout = QHBoxLayout()
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Şarkı ara...")
-        self.search_input.returnPressed.connect(self.search_music)
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(20)
+        shadow.setColor(QColor(0, 0, 0, 150))
+        self.main_frame.setGraphicsEffect(shadow)
+
+        layout = QVBoxLayout(self.main_frame)
+        layout.setContentsMargins(0,0,0,0)
+        layout.setSpacing(0)
+
+        # ÜST BAR
+        title_bar = QFrame()
+        title_bar.setFixedHeight(50)
+        title_bar.setStyleSheet("background-color: #191a24; border-top-left-radius: 15px; border-top-right-radius: 15px;")
+        tb = QHBoxLayout(title_bar)
+        tb.addWidget(QLabel("  ⚡ HypeVibe"))
+        tb.addStretch()
         
-        search_btn = QPushButton("Ara")
-        search_btn.setFixedWidth(80)
-        search_btn.clicked.connect(self.search_music)
+        btn_min = NeonButton('fa5s.minus', 16, "#f1fa8c")
+        btn_min.clicked.connect(self.showMinimized)
+        btn_close = NeonButton('fa5s.times', 16, "#ff5555")
+        btn_close.clicked.connect(self.close)
         
-        search_layout.addWidget(self.search_input)
-        search_layout.addWidget(search_btn)
+        tb.addWidget(btn_min)
+        tb.addWidget(btn_close)
+
+        # ORTA
+        content = QHBoxLayout()
+        sidebar = QFrame()
+        sidebar.setFixedWidth(240)
+        sidebar.setStyleSheet("background-color: #191a24; border-right: 1px solid #44475a;")
+        sb = QVBoxLayout(sidebar)
+        sb.addSpacing(20)
         
-        # --- 2. LİSTE ---
-        self.result_list = QListWidget()
-        self.result_list.setIconSize(QSize(100, 75))
-        self.result_list.itemDoubleClicked.connect(self.play_selected)
+        btn_home = SidebarButton("  Keşfet", 'fa5s.search')
+        btn_home.clicked.connect(lambda: self.pages.setCurrentIndex(0))
+        btn_lib = SidebarButton("  Kütüphanem", 'fa5s.heart')
+        btn_lib.clicked.connect(lambda: self.pages.setCurrentIndex(1))
         
-        # --- 3. PLAYER KONTROL PANELI ---
-        player_layout = QVBoxLayout()
+        sb.addWidget(btn_home)
+        sb.addWidget(btn_lib)
+        sb.addStretch()
         
-        # Bilgi ve Kapak
-        info_row = QHBoxLayout()
-        self.current_image = QLabel()
-        self.current_image.setFixedSize(60, 60)
-        self.current_image.setStyleSheet("background-color: #333;")
+        self.pages = QStackedWidget()
         
-        self.song_title = QLabel("Müzik seçilmedi")
-        self.song_title.setStyleSheet("font-size: 14px; font-weight: bold; margin-left: 10px;")
+        # Arama
+        p_search = QWidget()
+        ls = QVBoxLayout(p_search)
+        ls.setContentsMargins(30,30,30,30)
         
-        info_row.addWidget(self.current_image)
-        info_row.addWidget(self.song_title)
-        info_row.addStretch()
+        search_box = QHBoxLayout()
+        self.inp_search = QLineEdit()
+        self.inp_search.setPlaceholderText("Şarkı ara... (Enter)")
+        self.inp_search.returnPressed.connect(self.do_search)
+        btn_go = QPushButton()
+        btn_go.setIcon(qta.icon('fa5s.search', color='#1e1e2e'))
+        btn_go.setFixedSize(40,40)
+        btn_go.setStyleSheet("background-color: #bd93f9; border-radius: 20px;")
+        btn_go.clicked.connect(self.do_search)
         
-        # İlerleme Çubuğu (Seek Bar)
-        seek_layout = QHBoxLayout()
-        self.lbl_current_time = QLabel("00:00")
-        self.lbl_total_time = QLabel("00:00")
+        search_box.addWidget(self.inp_search)
+        search_box.addWidget(btn_go)
         
-        self.seek_slider = QSlider(Qt.Horizontal)
-        self.seek_slider.setRange(0, 1000)
-        self.seek_slider.sliderPressed.connect(self.slider_pressed)
-        self.seek_slider.sliderReleased.connect(self.slider_released)
-        self.seek_slider.valueChanged.connect(self.set_position)
+        self.list_results = QListWidget()
+        self.list_results.itemDoubleClicked.connect(lambda item: self.play_item(item, 'search'))
         
-        seek_layout.addWidget(self.lbl_current_time)
-        seek_layout.addWidget(self.seek_slider)
-        seek_layout.addWidget(self.lbl_total_time)
+        ls.addLayout(search_box)
+        ls.addWidget(QLabel("Sonuçlar (5 Adet):"))
+        ls.addWidget(self.list_results)
         
-        # Butonlar ve Ses
-        controls_row = QHBoxLayout()
+        # Kütüphane
+        p_lib = QWidget()
+        ll = QVBoxLayout(p_lib)
+        ll.setContentsMargins(30,30,30,30)
+        self.list_favs = QListWidget()
+        self.list_favs.itemDoubleClicked.connect(lambda item: self.play_item(item, 'fav'))
+        ll.addWidget(QLabel("💜 Favorilerim"))
+        ll.addWidget(self.list_favs)
+        self.load_favs_ui()
         
-        self.btn_play = QPushButton("Oynat")
-        self.btn_play.setFixedSize(80, 40)
+        self.pages.addWidget(p_search)
+        self.pages.addWidget(p_lib)
+        
+        content.addWidget(sidebar)
+        content.addWidget(self.pages)
+        
+        # ALT BAR
+        player_bar = QFrame()
+        player_bar.setFixedHeight(100)
+        player_bar.setStyleSheet("background-color: #15161e; border-top: 1px solid #bd93f9; border-bottom-left-radius: 15px; border-bottom-right-radius: 15px;")
+        pb = QHBoxLayout(player_bar)
+        
+        info = QVBoxLayout()
+        self.lbl_title = QLabel("Müzik Seçilmedi")
+        self.lbl_title.setStyleSheet("font-weight: bold;")
+        self.lbl_artist = QLabel("HypeVibe")
+        self.lbl_artist.setStyleSheet("color: #6272a4; font-size: 12px;")
+        info.addWidget(self.lbl_title)
+        info.addWidget(self.lbl_artist)
+        
+        ctrl = QVBoxLayout()
+        btns = QHBoxLayout()
+        self.btn_play = NeonButton('fa5s.play-circle', 45, "#bd93f9")
         self.btn_play.clicked.connect(self.toggle_play)
+        self.btn_prev = NeonButton('fa5s.step-backward', 20, "#f8f8f2")
+        self.btn_prev.clicked.connect(self.play_prev)
+        self.btn_next = NeonButton('fa5s.step-forward', 20, "#f8f8f2")
+        self.btn_next.clicked.connect(self.play_next)
         
-        # Ses Ayarı
-        vol_label = QLabel("Ses:")
-        self.vol_slider = QSlider(Qt.Horizontal)
-        self.vol_slider.setRange(0, 100)
-        self.vol_slider.setValue(70) # Varsayılan ses
-        self.vol_slider.setFixedWidth(100)
-        self.vol_slider.valueChanged.connect(self.set_volume)
+        btns.addStretch()
+        btns.addWidget(self.btn_prev)
+        btns.addWidget(self.btn_play)
+        btns.addWidget(self.btn_next)
+        btns.addStretch()
         
-        controls_row.addStretch()
-        controls_row.addWidget(self.btn_play)
-        controls_row.addStretch()
-        controls_row.addWidget(vol_label)
-        controls_row.addWidget(self.vol_slider)
+        seek = QHBoxLayout()
+        self.lbl_curr = QLabel("00:00")
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, 100)
+        self.slider.sliderReleased.connect(self.seek_audio)
+        self.lbl_total = QLabel("00:00")
+        seek.addWidget(self.lbl_curr)
+        seek.addWidget(self.slider)
+        seek.addWidget(self.lbl_total)
         
-        # Paneli Birleştir
-        player_layout.addLayout(info_row)
-        player_layout.addLayout(seek_layout)
-        player_layout.addLayout(controls_row)
+        ctrl.addLayout(btns)
+        ctrl.addLayout(seek)
         
-        # Ana Düzen
-        main_layout.addLayout(search_layout)
-        main_layout.addWidget(self.result_list)
-        main_layout.addSpacing(10)
-        main_layout.addLayout(player_layout)
+        extra = QHBoxLayout()
+        self.btn_like = NeonButton('fa5s.heart', 20, "#6272a4")
+        self.btn_like.clicked.connect(self.add_fav)
+        extra.addWidget(self.btn_like)
+        
+        pb.addLayout(info, 1)
+        pb.addStretch()
+        pb.addLayout(ctrl, 3)
+        pb.addStretch()
+        pb.addLayout(extra, 1)
+        
+        layout.addWidget(title_bar)
+        layout.addLayout(content)
+        layout.addWidget(player_bar)
+        
+        title_bar.mousePressEvent = self.mousePressEvent
+        title_bar.mouseMoveEvent = self.mouseMoveEvent
 
     # --- FONKSİYONLAR ---
-    def search_music(self):
-        query = self.search_input.text()
-        if not query: return
-        self.song_title.setText("Aranıyor...")
-        self.result_list.clear()
-        QApplication.processEvents()
+    def mousePressEvent(self, e): self.old_pos = e.globalPos()
+    def mouseMoveEvent(self, e):
+        if self.old_pos:
+            delta = QPoint(e.globalPos() - self.old_pos)
+            self.move(self.x() + delta.x(), self.y() + delta.y())
+            self.old_pos = e.globalPos()
+
+    def do_search(self):
+        q = self.inp_search.text()
+        if not q: return
+        self.list_results.clear()
+        self.lbl_title.setText("Aranıyor...")
+        self.search_thread = SearchThread(q)
+        self.search_thread.results_ready.connect(self.on_results)
+        self.search_thread.error_occurred.connect(lambda e: self.lbl_title.setText(f"Hata: {e}"))
+        self.search_thread.start()
+
+    def on_results(self, res):
+        self.lbl_title.setText(f"{len(res)} Sonuç")
+        for r in res:
+            title = r.get('title') or r.get('id') or 'Bilinmiyor'
+            url = r.get('url') or r.get('webpage_url') or r.get('id')
+            if not url: continue
+            
+            if len(url) == 11 and '.' not in url: url = f"https://www.youtube.com/watch?v={url}"
+            
+            it = QListWidgetItem(title)
+            it.setIcon(qta.icon('fa5s.music', color='#bd93f9'))
+            it.setData(Qt.UserRole, {'title': title, 'url': url})
+            self.list_results.addItem(it)
+
+    def play_item(self, item, src):
+        if src == 'search':
+            self.current_playlist = [self.list_results.item(i).data(Qt.UserRole) for i in range(self.list_results.count())]
+            self.current_index = self.list_results.row(item)
+        else:
+            self.current_playlist = self.favorites
+            self.current_index = self.list_favs.row(item)
+        self.load_music(item.data(Qt.UserRole))
+
+    def load_music(self, data):
+        self.current_data = data
+        self.lbl_title.setText("Yükleniyor...")
+        self.lbl_artist.setText(data['title'])
         
-        try:
-            ydl_opts = {'format': 'bestaudio/best', 'noplaylist': True, 'quiet': True, 'default_search': 'ytsearch5'}
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(query, download=False)
-                results = info.get('entries', [info])
-                for vid in results: self.add_item(vid)
-            self.song_title.setText("Bir şarkı seçin")
-        except: self.song_title.setText("Hata oluştu")
+        is_fav = any(f['url'] == data['url'] for f in self.favorites)
+        self.btn_like.setIcon(qta.icon('fa5s.heart', color='#ff5555' if is_fav else '#6272a4'))
+        
+        self.audio_thread = AudioThread(data['url'], data['title'])
+        self.audio_thread.url_ready.connect(self.start_vlc)
+        # Hata olursa pop-up çıkar
+        self.audio_thread.error_occurred.connect(lambda e: QMessageBox.warning(self, "Hata", f"Bağlantı Hatası: {e}"))
+        self.audio_thread.start()
 
-    def add_item(self, data):
-        item = QListWidgetItem(f"{data['title']}\n{data.get('duration_string', '')}")
-        if data.get('thumbnail'):
-            try:
-                pix = QPixmap()
-                pix.loadFromData(requests.get(data['thumbnail']).content)
-                item.setIcon(QIcon(pix))
-            except: pass
-        item.setData(Qt.UserRole, data)
-        self.result_list.addItem(item)
-
-    def play_selected(self, item):
-        data = item.data(Qt.UserRole)
-        self.player.set_media(self.instance.media_new(data['url']))
+    def start_vlc(self, url, title):
+        m = self.instance.media_new(url)
+        self.player.set_media(m)
         self.player.play()
-        
-        self.song_title.setText(data['title'][:40] + "..." if len(data['title'])>40 else data['title'])
-        self.btn_play.setText("Durdur")
-        self.timer.start()
-        
-        if data.get('thumbnail'):
-             pix = QPixmap()
-             pix.loadFromData(requests.get(data['thumbnail']).content)
-             self.current_image.setPixmap(pix.scaled(60, 60, Qt.KeepAspectRatio))
+        self.lbl_title.setText(title[:30] + "..." if len(title)>30 else title)
+        self.btn_play.setIcon(qta.icon('fa5s.pause-circle', color='#bd93f9'))
 
     def toggle_play(self):
         if self.player.is_playing():
             self.player.pause()
-            self.btn_play.setText("Devam")
+            self.btn_play.setIcon(qta.icon('fa5s.play-circle', color='#bd93f9'))
         else:
             self.player.play()
-            self.btn_play.setText("Durdur")
+            self.btn_play.setIcon(qta.icon('fa5s.pause-circle', color='#bd93f9'))
 
-    def update_ui(self):
-        # Eğer kullanıcı slider ile oynuyorsa güncelleme yapma (çatışma olmasın)
-        if self.player.is_playing() and not self.is_dragging:
-            # Toplam süre ve şu anki zaman
+    def play_next(self):
+        if self.current_playlist and self.current_index < len(self.current_playlist)-1:
+            self.current_index += 1
+            self.load_music(self.current_playlist[self.current_index])
+
+    def play_prev(self):
+        if self.current_playlist and self.current_index > 0:
+            self.current_index -= 1
+            self.load_music(self.current_playlist[self.current_index])
+
+    def seek_audio(self):
+        if self.player.is_playing():
             length = self.player.get_length()
-            current = self.player.get_time()
-            
-            if length > 0:
-                # Yüzdelik hesapla ve slider'ı güncelle (Binde bir hassasiyet)
-                perc = (current / length) * 1000
-                self.seek_slider.blockSignals(True) # Döngüye girmesin diye sinyali kes
-                self.seek_slider.setValue(int(perc))
-                self.seek_slider.blockSignals(False)
-                
-                # Süreleri yaz (Milisaniyeyi dakikaya çevir)
-                self.lbl_current_time.setText(self.format_time(current))
-                self.lbl_total_time.setText(self.format_time(length))
+            self.player.set_time(int(length * (self.slider.value()/100)))
 
-    def set_position(self, value):
-        # Kullanıcı slider'ı kaydırınca şarkıyı o konuma at
-        # Sadece sürükleme bittiğinde veya tıklandığında çalışmalı
-        if self.is_dragging: return # Sürüklerken atlama yapma, bırakınca yap
-        
-        length = self.player.get_length()
-        if length > 0:
-            target_time = length * (value / 1000)
-            self.player.set_time(int(target_time))
+    def update_slider(self):
+        if self.player.is_playing():
+            l = self.player.get_length()
+            c = self.player.get_time()
+            if l > 0:
+                self.slider.setValue(int((c/l)*100))
+                self.lbl_curr.setText(f"{c//60000:02}:{(c//1000)%60:02}")
+                self.lbl_total.setText(f"{l//60000:02}:{(l//1000)%60:02}")
 
-    def slider_pressed(self):
-        self.is_dragging = True # Kullanıcı tutuyor
+    def add_fav(self):
+        if hasattr(self, 'current_data'):
+            urls = [f['url'] for f in self.favorites]
+            if self.current_data['url'] in urls:
+                self.favorites = [f for f in self.favorites if f['url'] != self.current_data['url']]
+            else: self.favorites.append(self.current_data)
+            with open("favs.json", "w", encoding="utf-8") as f: json.dump(self.favorites, f, ensure_ascii=False)
+            self.load_favs_ui()
+            is_fav = any(f['url'] == self.current_data['url'] for f in self.favorites)
+            self.btn_like.setIcon(qta.icon('fa5s.heart', color='#ff5555' if is_fav else '#6272a4'))
 
-    def slider_released(self):
-        # Kullanıcı bıraktığında konumu ayarla
-        self.is_dragging = False
-        self.set_position(self.seek_slider.value())
-
-    def set_volume(self, value):
-        self.player.audio_set_volume(value)
-
-    def format_time(self, ms):
-        seconds = int(ms / 1000)
-        minutes, seconds = divmod(seconds, 60)
-        return f"{minutes:02}:{seconds:02}"
+    def load_favs_ui(self):
+        self.list_favs.clear()
+        for s in self.favorites:
+            it = QListWidgetItem(s['title'])
+            it.setIcon(qta.icon('fa5s.heart', color='#bd93f9'))
+            it.setData(Qt.UserRole, s)
+            self.list_favs.addItem(it)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = HypeVibePlayer()
+    window = HypeVibeNeon()
     window.show()
     sys.exit(app.exec_())
