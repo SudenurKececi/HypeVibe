@@ -1,7 +1,7 @@
 import sys
 import os
 import json
-import random  # Karışık çalmak için
+import random
 import requests
 import qtawesome as qta
 
@@ -33,7 +33,6 @@ if os.path.exists(vlc_path):
 
 
 # --- 2. ARKA PLAN İŞÇİLERİ ---
-
 class ImageLoader(QThread):
     image_loaded = pyqtSignal(object, object)
 
@@ -100,7 +99,7 @@ class AudioThread(QThread):
 
     def run(self):
         try:
-            # Not: video stream seçimi pratikte daha stabil olabiliyor.
+            # Stabil olsun diye video stream seçimi
             ydl_opts = {'format': 'best[height<=360]/best', 'quiet': True, 'noplaylist': True}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(self.url, download=False)
@@ -113,7 +112,6 @@ class AudioThread(QThread):
 
 
 # --- 3. TASARIM ---
-
 class NeonButton(QPushButton):
     def __init__(self, icon_name, size=24, color="#bd93f9", parent=None):
         super().__init__(parent)
@@ -141,9 +139,8 @@ class SidebarButton(QPushButton):
 
 
 # --- 4. ANA UYGULAMA ---
-
 class HypeVibeNeon(QMainWindow):
-    media_finished = pyqtSignal()  # VLC event -> Qt thread'e güvenli aktarım
+    media_finished = pyqtSignal()  # VLC event -> Qt thread
 
     def __init__(self):
         super().__init__()
@@ -151,42 +148,40 @@ class HypeVibeNeon(QMainWindow):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.resize(1150, 780)
 
-        # ✅ ÖNCE default_volume tanımla (init_ui içinde kullanılıyor)
+        # init_ui içinde kullanılıyor
         self.default_volume = 80
 
-        # Queue (Sıraya eklenenler)
+        # Queue
         self.queue = []
 
+        # VLC
         self.instance = None
         self.player = None
         try:
             self.instance = vlc.Instance("--no-video --network-caching=5000 --quiet")
             self.player = self.instance.media_player_new()
 
-            # VLC "bitti" event'i
             em = self.player.event_manager()
             em.event_attach(vlc.EventType.MediaPlayerEndReached, self._on_vlc_end)
 
-            # VLC threadinden gelen event -> Qt slot
             self.media_finished.connect(self.on_media_finished)
-
         except Exception:
             pass
 
+        # State
         self.favorites = self.load_favs()
         self.current_playlist = []
         self.current_index = -1
         self.image_threads = []
         self.old_pos = None
+        self.current_data = None
 
-        # Oynatma Modları
         self.is_shuffle = False
         self.is_repeat = False
 
         self.init_ui()
         self.init_style()
 
-        # VLC ses ayarı
         if self.player:
             try:
                 self.player.audio_set_volume(self.default_volume)
@@ -197,22 +192,24 @@ class HypeVibeNeon(QMainWindow):
         self.timer.timeout.connect(self.update_slider)
         self.timer.start(1000)
 
-    # Program Kapanırken Kaydet
-    def closeEvent(self, event):
-        self.save_favs_from_list()
-        event.accept()
+        self.refresh_queue_ui()
 
+    # --- VLC end event ---
     def _on_vlc_end(self, _event):
-        # VLC callback başka thread'de çalışabilir -> signal ile GUI thread'e geç
         try:
             self.media_finished.emit()
         except Exception:
             pass
 
     def on_media_finished(self):
-        # Şarkı bitti -> otomatik next
         self.play_next(auto=True)
 
+    # --- kapanış ---
+    def closeEvent(self, event):
+        self.save_favs_from_list()
+        event.accept()
+
+    # --- fav io ---
     def load_favs(self):
         if os.path.exists("favs.json"):
             try:
@@ -232,13 +229,14 @@ class HypeVibeNeon(QMainWindow):
         with open("favs.json", "w", encoding="utf-8") as f:
             json.dump(self.favorites, f, ensure_ascii=False)
 
+    # --- style ---
     def init_style(self):
         self.setStyleSheet("""
             QMainWindow { background-color: transparent; }
             QFrame#MainFrame { background-color: #1e1e2e; border-radius: 15px; border: 1px solid #44475a; }
             QLineEdit { background-color: #282a36; color: #f8f8f2; border-radius: 20px; padding: 10px 15px; border: 1px solid #44475a; }
             QListWidget { background-color: transparent; border: none; }
-            QListWidget::item { color: #f8f8f2; padding: 5px; margin: 2px; border-radius: 5px; }
+            QListWidget::item { color: #f8f8f2; padding: 6px; margin: 2px; border-radius: 6px; }
             QListWidget::item:hover { background-color: #44475a; }
             QListWidget::item:selected { background-color: rgba(189, 147, 249, 0.2); color: #bd93f9; }
             QLabel { color: #f8f8f2; font-family: 'Segoe UI', Arial; }
@@ -247,6 +245,7 @@ class HypeVibeNeon(QMainWindow):
             QSlider::sub-page:horizontal { background: #bd93f9; border-radius: 3px; }
         """)
 
+    # --- UI ---
     def init_ui(self):
         self.main_frame = QFrame(self)
         self.main_frame.setObjectName("MainFrame")
@@ -257,11 +256,11 @@ class HypeVibeNeon(QMainWindow):
         shadow.setColor(QColor(0, 0, 0, 150))
         self.main_frame.setGraphicsEffect(shadow)
 
-        layout = QVBoxLayout(self.main_frame)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+        root = QVBoxLayout(self.main_frame)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        # ÜST BAR
+        # Top bar
         title_bar = QFrame()
         title_bar.setFixedHeight(50)
         title_bar.setStyleSheet("background-color: #191a24; border-top-left-radius: 15px; border-top-right-radius: 15px;")
@@ -273,11 +272,10 @@ class HypeVibeNeon(QMainWindow):
         btn_min.clicked.connect(self.showMinimized)
         btn_close = NeonButton('fa5s.times', 16, "#ff5555")
         btn_close.clicked.connect(self.close)
-
         tb.addWidget(btn_min)
         tb.addWidget(btn_close)
 
-        # ORTA
+        # Middle
         content = QHBoxLayout()
 
         sidebar = QFrame()
@@ -286,18 +284,23 @@ class HypeVibeNeon(QMainWindow):
         sb = QVBoxLayout(sidebar)
         sb.addSpacing(20)
 
-        btn_home = SidebarButton("  Keşfet", 'fa5s.search')
-        btn_home.clicked.connect(lambda: self.pages.setCurrentIndex(0))
-        btn_lib = SidebarButton("  Kütüphanem", 'fa5s.heart')
-        btn_lib.clicked.connect(lambda: self.pages.setCurrentIndex(1))
-
-        sb.addWidget(btn_home)
-        sb.addWidget(btn_lib)
-        sb.addStretch()
-
         self.pages = QStackedWidget()
 
-        # Arama
+        self.btn_home = SidebarButton("  Keşfet", 'fa5s.search')
+        self.btn_home.clicked.connect(lambda: self.pages.setCurrentIndex(0))
+
+        self.btn_lib = SidebarButton("  Kütüphanem", 'fa5s.heart')
+        self.btn_lib.clicked.connect(lambda: self.pages.setCurrentIndex(1))
+
+        self.btn_queue = SidebarButton("  Sıradakiler (0)", 'fa5s.list')
+        self.btn_queue.clicked.connect(lambda: self.pages.setCurrentIndex(2))
+
+        sb.addWidget(self.btn_home)
+        sb.addWidget(self.btn_lib)
+        sb.addWidget(self.btn_queue)
+        sb.addStretch()
+
+        # --- Page 0: Search ---
         p_search = QWidget()
         ls = QVBoxLayout(p_search)
         ls.setContentsMargins(30, 30, 30, 30)
@@ -320,39 +323,67 @@ class HypeVibeNeon(QMainWindow):
         self.list_results.setIconSize(QSize(120, 90))
         self.list_results.itemDoubleClicked.connect(lambda item: self.play_item(item, 'search'))
 
+        # ✅ Arama sonuçları sağ tık menüsü
+        self.list_results.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list_results.customContextMenuRequested.connect(self.show_search_context_menu)
+
         ls.addLayout(search_box)
         ls.addWidget(QLabel("Sonuçlar (5 Adet):"))
         ls.addWidget(self.list_results)
 
-        # Kütüphane (Favoriler)
+        # --- Page 1: Library (Favs) ---
         p_lib = QWidget()
         ll = QVBoxLayout(p_lib)
         ll.setContentsMargins(30, 30, 30, 30)
 
         self.list_favs = QListWidget()
         self.list_favs.setIconSize(QSize(80, 60))
-
-        # Sürükle bırak
         self.list_favs.setDragDropMode(QAbstractItemView.InternalMove)
-
-        # Sağ tık menü
         self.list_favs.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.list_favs.customContextMenuRequested.connect(self.show_context_menu)
-
+        self.list_favs.customContextMenuRequested.connect(self.show_favs_context_menu)
         self.list_favs.itemDoubleClicked.connect(lambda item: self.play_item(item, 'fav'))
 
         ll.addWidget(QLabel("💜 Favorilerim (Sürükle & Sırala)"))
         ll.addWidget(self.list_favs)
-
         self.load_favs_ui()
 
+        # --- Page 2: Queue ---
+        p_queue = QWidget()
+        lq = QVBoxLayout(p_queue)
+        lq.setContentsMargins(30, 30, 30, 30)
+
+        top_row = QHBoxLayout()
+        self.lbl_nowplaying = QLabel("🎧 Şimdi Çalıyor: -")
+        self.lbl_nowplaying.setStyleSheet("font-weight: bold;")
+        btn_clear_queue = QPushButton("Queue Temizle")
+        btn_clear_queue.setCursor(Qt.PointingHandCursor)
+        btn_clear_queue.setStyleSheet("background-color:#282a36; color:#f8f8f2; padding:8px 12px; border-radius:10px; border:1px solid #44475a;")
+        btn_clear_queue.clicked.connect(self.clear_queue)
+
+        top_row.addWidget(self.lbl_nowplaying)
+        top_row.addStretch()
+        top_row.addWidget(btn_clear_queue)
+
+        self.list_queue = QListWidget()
+        self.list_queue.setIconSize(QSize(80, 60))
+        self.list_queue.setDragDropMode(QAbstractItemView.InternalMove)
+        self.list_queue.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list_queue.customContextMenuRequested.connect(self.show_queue_context_menu)
+        self.list_queue.itemDoubleClicked.connect(self.play_queue_item)
+
+        lq.addLayout(top_row)
+        lq.addWidget(QLabel("📌 Sıradakiler (Sürükle & Sırala):"))
+        lq.addWidget(self.list_queue)
+
+        # add pages
         self.pages.addWidget(p_search)
         self.pages.addWidget(p_lib)
+        self.pages.addWidget(p_queue)
 
         content.addWidget(sidebar)
         content.addWidget(self.pages)
 
-        # ALT BAR
+        # Bottom player bar
         player_bar = QFrame()
         player_bar.setFixedHeight(100)
         player_bar.setStyleSheet(
@@ -361,7 +392,7 @@ class HypeVibeNeon(QMainWindow):
         )
         pb = QHBoxLayout(player_bar)
 
-        # Sol bilgi
+        # Left info
         info_layout = QHBoxLayout()
         self.lbl_cover = QLabel()
         self.lbl_cover.setFixedSize(60, 60)
@@ -372,14 +403,13 @@ class HypeVibeNeon(QMainWindow):
         self.lbl_title.setStyleSheet("font-weight: bold;")
         self.lbl_artist = QLabel("HypeVibe")
         self.lbl_artist.setStyleSheet("color: #6272a4; font-size: 12px;")
-
         text_layout.addWidget(self.lbl_title)
         text_layout.addWidget(self.lbl_artist)
 
         info_layout.addWidget(self.lbl_cover)
         info_layout.addLayout(text_layout)
 
-        # Orta kontrol
+        # Center controls
         ctrl = QVBoxLayout()
         btns = QHBoxLayout()
 
@@ -420,7 +450,7 @@ class HypeVibeNeon(QMainWindow):
         ctrl.addLayout(btns)
         ctrl.addLayout(seek)
 
-        # Sağ taraf: like + volume
+        # Right: like + volume
         right = QVBoxLayout()
         right.setSpacing(6)
 
@@ -429,13 +459,11 @@ class HypeVibeNeon(QMainWindow):
 
         vol_row = QHBoxLayout()
         self.lbl_vol_icon = QLabel()
-
-        # ✅ default_volume ile başlat
         self._set_volume_icon(self.default_volume)
 
         self.slider_vol = QSlider(Qt.Horizontal)
         self.slider_vol.setRange(0, 100)
-        self.slider_vol.setValue(self.default_volume)  # ✅
+        self.slider_vol.setValue(self.default_volume)
         self.slider_vol.valueChanged.connect(self.set_volume)
         self.slider_vol.setFixedWidth(140)
 
@@ -451,14 +479,14 @@ class HypeVibeNeon(QMainWindow):
         pb.addStretch()
         pb.addLayout(right, 1)
 
-        layout.addWidget(title_bar)
-        layout.addLayout(content)
-        layout.addWidget(player_bar)
+        root.addWidget(title_bar)
+        root.addLayout(content)
+        root.addWidget(player_bar)
 
         title_bar.mousePressEvent = self.mousePressEvent
         title_bar.mouseMoveEvent = self.mouseMoveEvent
 
-    # --- Pencere taşıma ---
+    # --- window drag ---
     def mousePressEvent(self, e):
         self.old_pos = e.globalPos()
 
@@ -468,15 +496,113 @@ class HypeVibeNeon(QMainWindow):
             self.move(self.x() + delta.x(), self.y() + delta.y())
             self.old_pos = e.globalPos()
 
-    # --- Sağ tık menüsü (Favoriler) ---
-    def show_context_menu(self, pos):
+    # --- helpers ---
+    def is_in_favs(self, url: str) -> bool:
+        return any((f.get('url') == url) for f in self.favorites)
+
+    def add_to_queue(self, data: dict):
+        if not data or not data.get('url'):
+            return
+        self.queue.append(data)
+        self.refresh_queue_ui()
+
+    def toggle_favorite_data(self, data: dict):
+        if not data or not data.get('url'):
+            return
+
+        # list_favs üzerinden güncel favs setini kaydet
+        self.save_favs_from_list()
+
+        url = data['url']
+        if self.is_in_favs(url):
+            # kaldır
+            for i in range(self.list_favs.count()):
+                if self.list_favs.item(i).data(Qt.UserRole).get('url') == url:
+                    self.list_favs.takeItem(i)
+                    break
+        else:
+            it = QListWidgetItem(data.get('title', ''))
+            it.setIcon(qta.icon('fa5s.heart', color='#bd93f9'))
+            it.setData(Qt.UserRole, data)
+            self.list_favs.addItem(it)
+            if data.get('thumbnail'):
+                d = ImageLoader(data['thumbnail'], it)
+                d.image_loaded.connect(lambda i, p: i.setIcon(QIcon(p)))
+                self.image_threads.append(d)
+                d.start()
+
+        self.save_favs_from_list()
+
+        # şimdi çalan ise kalp ikonunu güncelle
+        if self.current_data and self.current_data.get('url') == url:
+            is_fav = self.is_in_favs(url)
+            self.btn_like.setIcon(qta.icon('fa5s.heart', color='#ff5555' if is_fav else '#6272a4'))
+
+    def refresh_queue_ui(self):
+        # sidebar text
+        if hasattr(self, 'btn_queue'):
+            self.btn_queue.setText(f"  Sıradakiler ({len(self.queue)})")
+
+        # now playing label
+        if hasattr(self, 'lbl_nowplaying'):
+            if self.current_data and self.current_data.get('title'):
+                t = self.current_data['title']
+                self.lbl_nowplaying.setText(f"🎧 Şimdi Çalıyor: {t[:60]}")
+            else:
+                self.lbl_nowplaying.setText("🎧 Şimdi Çalıyor: -")
+
+        # queue list
+        if not hasattr(self, 'list_queue'):
+            return
+
+        self.list_queue.clear()
+        for s in self.queue:
+            it = QListWidgetItem(s.get('title', ''))
+            it.setIcon(qta.icon('fa5s.list', color='#bd93f9'))
+            it.setData(Qt.UserRole, s)
+            self.list_queue.addItem(it)
+
+            if s.get('thumbnail'):
+                d = ImageLoader(s['thumbnail'], it)
+                d.image_loaded.connect(lambda i, p: i.setIcon(QIcon(p)))
+                self.image_threads.append(d)
+                d.start()
+
+    # --- Search right-click menu ---
+    def show_search_context_menu(self, pos):
+        item = self.list_results.itemAt(pos)
+        if not item:
+            return
+        data = item.data(Qt.UserRole) or {}
+        url = data.get('url', '')
+
+        menu = QMenu()
+        act_queue = menu.addAction("➕ Queue’ya Ekle")
+        act_fav = menu.addAction("💜 Favoriye Ekle / Çıkar")
+        act_copy = menu.addAction("🔗 Link Kopyala")
+
+        action = menu.exec_(self.list_results.mapToGlobal(pos))
+        if not action:
+            return
+
+        if action == act_queue:
+            self.add_to_queue(data)
+
+        elif action == act_fav:
+            self.toggle_favorite_data(data)
+
+        elif action == act_copy:
+            QApplication.clipboard().setText(url or "")
+
+    # --- Fav right-click menu ---
+    def show_favs_context_menu(self, pos):
         item = self.list_favs.itemAt(pos)
         if not item:
             return
+        data = item.data(Qt.UserRole)
 
         menu = QMenu()
-
-        act_queue = menu.addAction("➕ Sıraya Ekle (Queue)")
+        act_queue = menu.addAction("➕ Queue’ya Ekle")
         menu.addSeparator()
         act_top = menu.addAction("⬆️ En Üste Taşı")
         act_bottom = menu.addAction("⬇️ En Alta Taşı")
@@ -488,7 +614,7 @@ class HypeVibeNeon(QMainWindow):
             return
 
         if action == act_queue:
-            self.queue.append(item.data(Qt.UserRole))
+            self.add_to_queue(data)
 
         elif action == act_top:
             row = self.list_favs.row(item)
@@ -512,6 +638,64 @@ class HypeVibeNeon(QMainWindow):
             self.save_favs_from_list()
             self.btn_like.setIcon(qta.icon('fa5s.heart', color='#6272a4'))
 
+    # --- Queue right-click menu ---
+    def show_queue_context_menu(self, pos):
+        item = self.list_queue.itemAt(pos)
+        menu = QMenu()
+
+        act_play = menu.addAction("▶️ Şimdi Çal")
+        act_remove = menu.addAction("🗑️ Queue’dan Kaldır")
+        menu.addSeparator()
+        act_up = menu.addAction("⬆️ Yukarı Taşı")
+        act_down = menu.addAction("⬇️ Aşağı Taşı")
+        menu.addSeparator()
+        act_clear = menu.addAction("🧹 Queue Temizle")
+
+        action = menu.exec_(self.list_queue.mapToGlobal(pos))
+        if not action:
+            return
+
+        if action == act_clear:
+            self.clear_queue()
+            return
+
+        if not item:
+            return
+
+        row = self.list_queue.row(item)
+
+        if action == act_play:
+            self.play_queue_item(item)
+
+        elif action == act_remove:
+            if 0 <= row < len(self.queue):
+                self.queue.pop(row)
+                self.refresh_queue_ui()
+
+        elif action == act_up:
+            if row > 0 and row < len(self.queue):
+                self.queue[row - 1], self.queue[row] = self.queue[row], self.queue[row - 1]
+                self.refresh_queue_ui()
+                self.list_queue.setCurrentRow(row - 1)
+
+        elif action == act_down:
+            if 0 <= row < len(self.queue) - 1:
+                self.queue[row + 1], self.queue[row] = self.queue[row], self.queue[row + 1]
+                self.refresh_queue_ui()
+                self.list_queue.setCurrentRow(row + 1)
+
+    def clear_queue(self):
+        self.queue = []
+        self.refresh_queue_ui()
+
+    def play_queue_item(self, item):
+        # çift tık / menüden play: queue’dan çıkarıp çal
+        row = self.list_queue.row(item)
+        if 0 <= row < len(self.queue):
+            data = self.queue.pop(row)
+            self.refresh_queue_ui()
+            self.load_music(data)
+
     # --- Modlar ---
     def toggle_shuffle(self, _checked=False):
         self.is_shuffle = not self.is_shuffle
@@ -523,7 +707,7 @@ class HypeVibeNeon(QMainWindow):
         color = "#bd93f9" if self.is_repeat else "#6272a4"
         self.btn_repeat.setIcon(qta.icon('fa5s.redo', color=color))
 
-    # --- Ses ---
+    # --- Volume ---
     def _set_volume_icon(self, v):
         if v <= 0:
             icon = qta.icon('fa5s.volume-mute', color='#f8f8f2')
@@ -541,7 +725,7 @@ class HypeVibeNeon(QMainWindow):
             except Exception:
                 pass
 
-    # --- Arama ---
+    # --- Search ---
     def do_search(self):
         q = self.inp_search.text().strip()
         if not q:
@@ -566,7 +750,6 @@ class HypeVibeNeon(QMainWindow):
 
             if not url:
                 continue
-
             if len(url) == 11 and '.' not in url:
                 url = f"https://www.youtube.com/watch?v={url}"
 
@@ -581,7 +764,7 @@ class HypeVibeNeon(QMainWindow):
                 self.image_threads.append(d)
                 d.start()
 
-    # --- Çalma ---
+    # --- Play item ---
     def play_item(self, item, src):
         if src == 'search':
             self.current_playlist = [self.list_results.item(i).data(Qt.UserRole) for i in range(self.list_results.count())]
@@ -597,8 +780,10 @@ class HypeVibeNeon(QMainWindow):
         self.lbl_title.setText("Yükleniyor...")
         self.lbl_artist.setText(data.get('title', ''))
 
-        is_fav = any(f.get('url') == data.get('url') for f in self.favorites)
+        is_fav = self.is_in_favs(data.get('url', ''))
         self.btn_like.setIcon(qta.icon('fa5s.heart', color='#ff5555' if is_fav else '#6272a4'))
+
+        self.refresh_queue_ui()
 
         if not self.instance or not self.player:
             QMessageBox.warning(self, "Hata", "VLC başlatılamadı. VLC kurulu mu?")
@@ -617,7 +802,6 @@ class HypeVibeNeon(QMainWindow):
         self.player.set_media(m)
         self.player.play()
 
-        # ses slider'ı her play'de tekrar uygula
         try:
             self.player.audio_set_volume(int(self.slider_vol.value()))
         except Exception:
@@ -636,6 +820,8 @@ class HypeVibeNeon(QMainWindow):
             self.image_threads.append(d)
             d.start()
 
+        self.refresh_queue_ui()
+
     def toggle_play(self, _checked=False):
         if not self.player:
             return
@@ -652,10 +838,11 @@ class HypeVibeNeon(QMainWindow):
     def stop_ui(self):
         self.btn_play.setIcon(qta.icon('fa5s.play-circle', color='#bd93f9'))
 
-    def play_next(self, auto=False):
+    def play_next(self, _checked=False, auto=False):
         # 1) Queue varsa önce onu çal
         if self.queue:
             nxt = self.queue.pop(0)
+            self.refresh_queue_ui()
             self.load_music(nxt)
             return
 
@@ -664,18 +851,17 @@ class HypeVibeNeon(QMainWindow):
                 self.stop_ui()
             return
 
-        # Karışık
+        # shuffle
         if self.is_shuffle:
             self.current_index = random.randint(0, len(self.current_playlist) - 1)
             self.load_music(self.current_playlist[self.current_index])
             return
 
-        # Normal
+        # normal
         if self.current_index < len(self.current_playlist) - 1:
             self.current_index += 1
             self.load_music(self.current_playlist[self.current_index])
         else:
-            # Liste bitti
             if self.is_repeat:
                 self.current_index = 0
                 self.load_music(self.current_playlist[self.current_index])
@@ -719,40 +905,13 @@ class HypeVibeNeon(QMainWindow):
         except Exception:
             pass
 
-    # --- Favori toggle ---
+    # --- Like button (current) ---
     def add_fav(self, _checked=False):
-        if not hasattr(self, 'current_data'):
+        if not self.current_data:
             return
+        self.toggle_favorite_data(self.current_data)
 
-        self.save_favs_from_list()
-
-        already_in = False
-        for i in range(self.list_favs.count()):
-            if self.list_favs.item(i).data(Qt.UserRole).get('url') == self.current_data.get('url'):
-                already_in = True
-                break
-
-        if already_in:
-            for i in range(self.list_favs.count()):
-                if self.list_favs.item(i).data(Qt.UserRole).get('url') == self.current_data.get('url'):
-                    self.list_favs.takeItem(i)
-                    break
-            self.btn_like.setIcon(qta.icon('fa5s.heart', color='#6272a4'))
-        else:
-            it = QListWidgetItem(self.current_data.get('title', ''))
-            it.setIcon(qta.icon('fa5s.heart', color='#bd93f9'))
-            it.setData(Qt.UserRole, self.current_data)
-            self.list_favs.addItem(it)
-            self.btn_like.setIcon(qta.icon('fa5s.heart', color='#ff5555'))
-
-            if self.current_data.get('thumbnail'):
-                d = ImageLoader(self.current_data['thumbnail'], it)
-                d.image_loaded.connect(lambda i, p: i.setIcon(QIcon(p)))
-                self.image_threads.append(d)
-                d.start()
-
-        self.save_favs_from_list()
-
+    # --- load fav ui ---
     def load_favs_ui(self):
         self.list_favs.clear()
         for s in self.favorites:
