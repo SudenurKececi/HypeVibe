@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QSlider, QFrame,
     QStackedWidget, QGraphicsDropShadowEffect, QMessageBox, QMenu,
-    QAbstractItemView
+    QAbstractItemView, QInputDialog, QSplitter
 )
 from PyQt5.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal, QPoint
 from PyQt5.QtGui import QColor, QPixmap, QIcon
@@ -43,7 +43,9 @@ class ImageLoader(QThread):
 
     def run(self):
         try:
-            data = requests.get(self.url, timeout=7).content
+            # Standart tarayıcı gibi resim indir
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            data = requests.get(self.url, headers=headers, timeout=10).content
             pixmap = QPixmap()
             pixmap.loadFromData(data)
             self.image_loaded.emit(self.item, pixmap)
@@ -61,11 +63,12 @@ class SearchThread(QThread):
 
     def run(self):
         try:
+            # Arama ayarları
             ydl_opts = {
                 'quiet': True,
                 'noplaylist': True,
                 'default_search': 'ytsearch5',
-                'extract_flat': False
+                'extract_flat': False,
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(self.query, download=False)
@@ -99,15 +102,35 @@ class AudioThread(QThread):
 
     def run(self):
         try:
-            ydl_opts = {'format': 'best[height<=360]/best', 'quiet': True, 'noplaylist': True}
+            # --- KESİN ÇÖZÜM: FORMAT 18 ---
+            # Format 18: 640x360 MP4 (H.264 + AAC).
+            # Bu format HLS (m3u8) içermez, bu yüzden 403 hatasına takılmaz.
+            ydl_opts = {
+                'format': '18/best[ext=mp4]', # Önce Format 18'i zorla, olmazsa en iyi MP4'ü al
+                'quiet': True,
+                'noplaylist': True,
+                'youtube_include_dash_manifest': False, # Karmaşık yayınları engelle
+                # 'android' istemcisi bu formatı sorunsuz verir
+                'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
+            }
+            
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(self.url, download=False)
+                
+                # Eğer android başarısız olursa (nadiren), iOS dene
                 if not info or 'url' not in info:
-                    self.error_occurred.emit("Stream URL alınamadı.")
+                    ydl_opts['extractor_args'] = {'youtube': {'player_client': ['ios']}}
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl2:
+                        info = ydl2.extract_info(self.url, download=False)
+                
+                if not info or 'url' not in info:
+                    self.error_occurred.emit("Bağlantı alınamadı (Format sorunu).")
                     return
+                    
                 self.url_ready.emit(info['url'], self.title)
+                
         except Exception as e:
-            self.error_occurred.emit(str(e))
+            self.error_occurred.emit(f"Hata: {str(e)}")
 
 
 # --- 3. TASARIM ---
@@ -137,7 +160,6 @@ class SidebarButton(QPushButton):
         )
 
 
-# ✅ Queue drag-drop sonrası sıra değişince sinyal verir
 class ReorderableListWidget(QListWidget):
     order_changed = pyqtSignal()
 
@@ -148,7 +170,7 @@ class ReorderableListWidget(QListWidget):
 
 # --- 4. ANA UYGULAMA ---
 class HypeVibeNeon(QMainWindow):
-    media_finished = pyqtSignal()  # VLC event -> Qt thread
+    media_finished = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -158,30 +180,30 @@ class HypeVibeNeon(QMainWindow):
 
         self.default_volume = 80
 
-        # Queue (kalıcı)
-        self.queue = self.load_queue()
+        # Veri Yükleme
+        self.queue = self.load_json("queue.json", [])
+        self.favorites = self.load_json("favs.json", [])
+        self.playlists = self.load_json("playlists.json", {})
 
-        # VLC
+        # VLC - Video penceresini gizle, önbelleği artır
         self.instance = None
         self.player = None
         try:
-            self.instance = vlc.Instance("--no-video --network-caching=5000 --quiet")
+            self.instance = vlc.Instance("--no-video --network-caching=10000 --quiet")
             self.player = self.instance.media_player_new()
-
             em = self.player.event_manager()
             em.event_attach(vlc.EventType.MediaPlayerEndReached, self._on_vlc_end)
-
             self.media_finished.connect(self.on_media_finished)
         except Exception:
             pass
 
         # State
-        self.favorites = self.load_favs()
         self.current_playlist = []
         self.current_index = -1
         self.image_threads = []
         self.old_pos = None
         self.current_data = None
+        self.selected_playlist_name = None 
 
         self.is_shuffle = False
         self.is_repeat = False
@@ -201,78 +223,51 @@ class HypeVibeNeon(QMainWindow):
 
         self.refresh_queue_ui()
 
-    # --- CRASH FIX: item silinmişse ikon basmaya çalışma ---
+    # --- JSON Helper ---
+    def load_json(self, filename, default):
+        if os.path.exists(filename):
+            try:
+                with open(filename, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return default
+        return default
+
+    def save_json(self, filename, data):
+        try:
+            with open(filename, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+        except Exception:
+            pass
+
+    # --- Helper UI ---
     def safe_set_item_icon(self, item, pixmap):
         try:
-            if item is None:
-                return
+            if item is None: return
             item.setIcon(QIcon(pixmap))
-        except RuntimeError:
-            pass
+        except RuntimeError: pass
 
     def safe_set_cover_pixmap(self, _item, pixmap):
         try:
-            self.lbl_cover.setPixmap(
-                pixmap.scaled(60, 60, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            )
-        except RuntimeError:
-            pass
+            self.lbl_cover.setPixmap(pixmap.scaled(60, 60, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        except RuntimeError: pass
 
-    # --- Queue kalıcı: load/save ---
-    def load_queue(self):
-        if os.path.exists("queue.json"):
-            try:
-                with open("queue.json", "r", encoding="utf-8") as f:
-                    q = json.load(f)
-                return q if isinstance(q, list) else []
-            except Exception:
-                return []
-        return []
-
-    def save_queue(self):
-        try:
-            with open("queue.json", "w", encoding="utf-8") as f:
-                json.dump(self.queue, f, ensure_ascii=False)
-        except Exception:
-            pass
-
-    # --- VLC end event ---
+    # --- VLC Event ---
     def _on_vlc_end(self, _event):
-        try:
-            self.media_finished.emit()
-        except Exception:
-            pass
+        try: self.media_finished.emit()
+        except Exception: pass
 
     def on_media_finished(self):
         self.play_next(auto=True)
 
-    # --- kapanış ---
+    # --- Kapanış ---
     def closeEvent(self, event):
-        self.save_favs_from_list()
-        self.save_queue()
+        self.save_json("favs.json", self.favorites)
+        self.save_json("queue.json", self.queue)
+        self.save_json("playlists.json", self.playlists)
         event.accept()
 
-    # --- fav io ---
-    def load_favs(self):
-        if os.path.exists("favs.json"):
-            try:
-                with open("favs.json", "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                return []
-        return []
-
-    def save_favs_from_list(self):
-        new_favs = []
-        for i in range(self.list_favs.count()):
-            item = self.list_favs.item(i)
-            new_favs.append(item.data(Qt.UserRole))
-
-        self.favorites = new_favs
-        with open("favs.json", "w", encoding="utf-8") as f:
-            json.dump(self.favorites, f, ensure_ascii=False)
-
-    # --- style ---
+    # --- Style ---
     def init_style(self):
         self.setStyleSheet("""
             QMainWindow { background-color: transparent; }
@@ -286,6 +281,7 @@ class HypeVibeNeon(QMainWindow):
             QSlider::groove:horizontal { height: 6px; background: #44475a; border-radius: 3px; }
             QSlider::handle:horizontal { background: #bd93f9; width: 14px; margin: -4px 0; border-radius: 7px; }
             QSlider::sub-page:horizontal { background: #bd93f9; border-radius: 3px; }
+            QSplitter::handle { background-color: #44475a; }
         """)
 
     # --- UI ---
@@ -335,11 +331,15 @@ class HypeVibeNeon(QMainWindow):
         self.btn_lib = SidebarButton("  Kütüphanem", 'fa5s.heart')
         self.btn_lib.clicked.connect(lambda: self.pages.setCurrentIndex(1))
 
+        self.btn_playlists = SidebarButton("  Playlistlerim", 'fa5s.list-alt')
+        self.btn_playlists.clicked.connect(lambda: self.pages.setCurrentIndex(2))
+
         self.btn_queue = SidebarButton("  Sıradakiler (0)", 'fa5s.list')
-        self.btn_queue.clicked.connect(lambda: self.pages.setCurrentIndex(2))
+        self.btn_queue.clicked.connect(lambda: self.pages.setCurrentIndex(3))
 
         sb.addWidget(self.btn_home)
         sb.addWidget(self.btn_lib)
+        sb.addWidget(self.btn_playlists)
         sb.addWidget(self.btn_queue)
         sb.addStretch()
 
@@ -365,9 +365,8 @@ class HypeVibeNeon(QMainWindow):
         self.list_results = QListWidget()
         self.list_results.setIconSize(QSize(120, 90))
         self.list_results.itemDoubleClicked.connect(lambda item: self.play_item(item, 'search'))
-
         self.list_results.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.list_results.customContextMenuRequested.connect(self.show_search_context_menu)
+        self.list_results.customContextMenuRequested.connect(lambda pos: self.show_generic_context_menu(pos, self.list_results))
 
         ls.addLayout(search_box)
         ls.addWidget(QLabel("Sonuçlar (5 Adet):"))
@@ -378,18 +377,57 @@ class HypeVibeNeon(QMainWindow):
         ll = QVBoxLayout(p_lib)
         ll.setContentsMargins(30, 30, 30, 30)
 
-        self.list_favs = QListWidget()
+        self.list_favs = ReorderableListWidget()
         self.list_favs.setIconSize(QSize(80, 60))
         self.list_favs.setDragDropMode(QAbstractItemView.InternalMove)
+        self.list_favs.order_changed.connect(lambda: self.save_json("favs.json", self.get_list_data(self.list_favs)))
         self.list_favs.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.list_favs.customContextMenuRequested.connect(self.show_favs_context_menu)
+        self.list_favs.customContextMenuRequested.connect(lambda pos: self.show_generic_context_menu(pos, self.list_favs, is_fav=True))
         self.list_favs.itemDoubleClicked.connect(lambda item: self.play_item(item, 'fav'))
 
         ll.addWidget(QLabel("💜 Favorilerim (Sürükle & Sırala)"))
         ll.addWidget(self.list_favs)
         self.load_favs_ui()
 
-        # --- Page 2: Queue ---
+        # --- Page 2: Playlists ---
+        p_playlists = QWidget()
+        lp = QVBoxLayout(p_playlists)
+        lp.setContentsMargins(20, 20, 20, 20)
+
+        pl_top = QHBoxLayout()
+        btn_new_pl = QPushButton("➕ Yeni Playlist")
+        btn_new_pl.setCursor(Qt.PointingHandCursor)
+        btn_new_pl.setStyleSheet("background-color: #44475a; color: white; padding: 8px; border-radius: 10px;")
+        btn_new_pl.clicked.connect(self.create_new_playlist)
+        pl_top.addWidget(QLabel("📂 Playlistlerim"))
+        pl_top.addStretch()
+        pl_top.addWidget(btn_new_pl)
+
+        splitter = QSplitter(Qt.Horizontal)
+        
+        self.list_pl_names = QListWidget()
+        self.list_pl_names.setStyleSheet("background-color: rgba(0,0,0,0.2); border-radius: 10px;")
+        self.list_pl_names.itemClicked.connect(self.load_playlist_songs_ui)
+        self.list_pl_names.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list_pl_names.customContextMenuRequested.connect(self.show_playlist_names_menu)
+
+        self.list_pl_songs = ReorderableListWidget()
+        self.list_pl_songs.setIconSize(QSize(80, 60))
+        self.list_pl_songs.setDragDropMode(QAbstractItemView.InternalMove)
+        self.list_pl_songs.order_changed.connect(self.save_current_playlist_order)
+        self.list_pl_songs.itemDoubleClicked.connect(lambda item: self.play_item(item, 'playlist'))
+        self.list_pl_songs.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list_pl_songs.customContextMenuRequested.connect(self.show_playlist_songs_menu)
+
+        splitter.addWidget(self.list_pl_names)
+        splitter.addWidget(self.list_pl_songs)
+        splitter.setSizes([300, 700])
+
+        lp.addLayout(pl_top)
+        lp.addWidget(splitter)
+        self.refresh_playlists_ui()
+
+        # --- Page 3: Queue ---
         p_queue = QWidget()
         lq = QVBoxLayout(p_queue)
         lq.setContentsMargins(30, 30, 30, 30)
@@ -421,9 +459,9 @@ class HypeVibeNeon(QMainWindow):
         lq.addWidget(QLabel("📌 Sıradakiler (Sürükle & Sırala):"))
         lq.addWidget(self.list_queue)
 
-        # add pages
         self.pages.addWidget(p_search)
         self.pages.addWidget(p_lib)
+        self.pages.addWidget(p_playlists)
         self.pages.addWidget(p_queue)
 
         content.addWidget(sidebar)
@@ -532,7 +570,7 @@ class HypeVibeNeon(QMainWindow):
         title_bar.mousePressEvent = self.mousePressEvent
         title_bar.mouseMoveEvent = self.mouseMoveEvent
 
-    # --- window drag ---
+    # --- Window Drag ---
     def mousePressEvent(self, e):
         self.old_pos = e.globalPos()
 
@@ -542,19 +580,15 @@ class HypeVibeNeon(QMainWindow):
             self.move(self.x() + delta.x(), self.y() + delta.y())
             self.old_pos = e.globalPos()
 
-    # --- helpers ---
+    # --- Helpers ---
     def is_in_favs(self, url: str) -> bool:
         return any((f.get('url') == url) for f in self.favorites)
 
-    # Search item'a fav marker (💜 + pembe)
-    def apply_fav_marker_to_search_item(self, item: QListWidgetItem, is_fav: bool, base_title: str):
-        if is_fav:
-            if not item.text().startswith("💜 "):
-                item.setText("💜 " + base_title)
-            item.setForeground(QColor("#ff79c6"))
-        else:
-            item.setText(base_title)
-            item.setForeground(QColor("#f8f8f2"))
+    def get_list_data(self, list_widget):
+        data = []
+        for i in range(list_widget.count()):
+            data.append(list_widget.item(i).data(Qt.UserRole))
+        return data
 
     def update_search_marker_for_url(self, url: str):
         is_fav = self.is_in_favs(url)
@@ -562,64 +596,176 @@ class HypeVibeNeon(QMainWindow):
             it = self.list_results.item(i)
             d = it.data(Qt.UserRole) or {}
             if d.get("url") == url:
-                base = d.get("title", it.text().replace("💜 ", ""))
-                self.apply_fav_marker_to_search_item(it, is_fav, base)
+                if is_fav:
+                    it.setForeground(QColor("#ff79c6"))
+                    if not it.text().startswith("💜 "):
+                        it.setText("💜 " + it.text())
+                else:
+                    it.setForeground(QColor("#f8f8f2"))
+                    it.setText(it.text().replace("💜 ", ""))
 
+    # --- Queue ---
     def add_to_queue(self, data: dict):
-        if not data or not data.get('url'):
-            return
+        if not data or not data.get('url'): return
         self.queue.append(data)
-        self.save_queue()
+        self.save_json("queue.json", self.queue)
         self.refresh_queue_ui()
 
     def sync_queue_from_widget(self):
-        new_queue = []
-        for i in range(self.list_queue.count()):
-            item = self.list_queue.item(i)
-            d = item.data(Qt.UserRole)
-            if d:
-                new_queue.append(d)
-        self.queue = new_queue
-        self.save_queue()
+        self.queue = self.get_list_data(self.list_queue)
+        self.save_json("queue.json", self.queue)
         self.btn_queue.setText(f"  Sıradakiler ({len(self.queue)})")
 
     def toggle_favorite_data(self, data: dict):
-        if not data or not data.get('url'):
-            return
-
-        self.save_favs_from_list()
+        if not data or not data.get('url'): return
         url = data['url']
 
         if self.is_in_favs(url):
-            for i in range(self.list_favs.count()):
-                if self.list_favs.item(i).data(Qt.UserRole).get('url') == url:
-                    self.list_favs.takeItem(i)
-                    break
+            self.favorites = [f for f in self.favorites if f.get('url') != url]
         else:
-            it = QListWidgetItem(data.get('title', ''))
-            it.setIcon(qta.icon('fa5s.heart', color='#bd93f9'))
-            it.setData(Qt.UserRole, data)
-            self.list_favs.addItem(it)
-            if data.get('thumbnail'):
-                d = ImageLoader(data['thumbnail'], it)
+            self.favorites.append(data)
+        
+        self.save_json("favs.json", self.favorites)
+        self.load_favs_ui()
+        
+        if self.current_data and self.current_data.get('url') == url:
+            is_fav = self.is_in_favs(url)
+            self.btn_like.setIcon(qta.icon('fa5s.heart', color='#ff5555' if is_fav else '#6272a4'))
+        
+        self.update_search_marker_for_url(url)
+
+    # --- PLAYLIST LOGIC ---
+    def create_new_playlist(self):
+        name, ok = QInputDialog.getText(self, "Yeni Playlist", "Playlist Adı:")
+        if ok and name:
+            if name in self.playlists:
+                QMessageBox.warning(self, "Hata", "Bu isimde bir playlist zaten var.")
+            else:
+                self.playlists[name] = []
+                self.save_json("playlists.json", self.playlists)
+                self.refresh_playlists_ui()
+
+    def refresh_playlists_ui(self):
+        self.list_pl_names.clear()
+        for name in self.playlists.keys():
+            it = QListWidgetItem(name)
+            it.setIcon(qta.icon('fa5s.folder', color='#bd93f9'))
+            self.list_pl_names.addItem(it)
+
+    def load_playlist_songs_ui(self, item):
+        self.selected_playlist_name = item.text()
+        self.list_pl_songs.clear()
+        songs = self.playlists.get(self.selected_playlist_name, [])
+        for s in songs:
+            it = QListWidgetItem(s.get('title', ''))
+            it.setIcon(qta.icon('fa5s.music', color='#f8f8f2'))
+            it.setData(Qt.UserRole, s)
+            self.list_pl_songs.addItem(it)
+            if s.get('thumbnail'):
+                d = ImageLoader(s['thumbnail'], it)
                 d.image_loaded.connect(self.safe_set_item_icon)
                 self.image_threads.append(d)
                 d.start()
 
-        self.save_favs_from_list()
+    def add_to_playlist_dialog(self, data):
+        if not self.playlists:
+            QMessageBox.information(self, "Bilgi", "Önce bir playlist oluşturmalısın.")
+            return
+        
+        names = list(self.playlists.keys())
+        name, ok = QInputDialog.getItem(self, "Playlist Seç", "Şarkıyı hangi playliste ekleyelim?", names, 0, False)
+        if ok and name:
+            self.playlists[name].append(data)
+            self.save_json("playlists.json", self.playlists)
+            QMessageBox.information(self, "Başarılı", f"Şarkı '{name}' listesine eklendi.")
+            if self.selected_playlist_name == name:
+                self.load_playlist_songs_ui(self.list_pl_names.findItems(name, Qt.MatchExactly)[0])
 
-        if self.current_data and self.current_data.get('url') == url:
-            is_fav = self.is_in_favs(url)
-            self.btn_like.setIcon(qta.icon('fa5s.heart', color='#ff5555' if is_fav else '#6272a4'))
+    def save_current_playlist_order(self):
+        if self.selected_playlist_name:
+            new_songs = self.get_list_data(self.list_pl_songs)
+            self.playlists[self.selected_playlist_name] = new_songs
+            self.save_json("playlists.json", self.playlists)
 
-        self.update_search_marker_for_url(url)
+    # --- MENÜLER ---
+    def show_generic_context_menu(self, pos, list_widget, is_fav=False):
+        item = list_widget.itemAt(pos)
+        if not item: return
+        data = item.data(Qt.UserRole)
 
+        menu = QMenu()
+        act_queue = menu.addAction("➕ Queue’ya Ekle")
+        act_pl = menu.addAction("📂 Playlist'e Ekle...")
+        act_fav = menu.addAction("💜 Favoriye Ekle / Çıkar")
+        
+        if is_fav:
+            menu.addSeparator()
+            act_del = menu.addAction("🗑️ Listeden Kaldır")
+
+        action = menu.exec_(list_widget.mapToGlobal(pos))
+        if not action: return
+
+        if action == act_queue: self.add_to_queue(data)
+        elif action == act_pl: self.add_to_playlist_dialog(data)
+        elif action == act_fav: self.toggle_favorite_data(data)
+        elif is_fav and action == act_del:
+            row = list_widget.row(item)
+            list_widget.takeItem(row)
+            self.favorites = self.get_list_data(list_widget)
+            self.save_json("favs.json", self.favorites)
+            self.btn_like.setIcon(qta.icon('fa5s.heart', color='#6272a4'))
+
+    def show_queue_context_menu(self, pos):
+        item = self.list_queue.itemAt(pos)
+        menu = QMenu()
+        act_play = menu.addAction("▶️ Şimdi Çal")
+        act_pl = menu.addAction("📂 Playlist'e Ekle...")
+        act_remove = menu.addAction("🗑️ Queue’dan Kaldır")
+        
+        action = menu.exec_(self.list_queue.mapToGlobal(pos))
+        if not action: return
+
+        if action == act_pl:
+            self.add_to_playlist_dialog(item.data(Qt.UserRole))
+        elif action == act_play:
+            self.play_queue_item(item)
+        elif action == act_remove:
+            self.list_queue.takeItem(self.list_queue.row(item))
+            self.sync_queue_from_widget()
+
+    def show_playlist_names_menu(self, pos):
+        item = self.list_pl_names.itemAt(pos)
+        if not item: return
+        menu = QMenu()
+        act_del = menu.addAction("🗑️ Playlisti Sil")
+        action = menu.exec_(self.list_pl_names.mapToGlobal(pos))
+        if action == act_del:
+            name = item.text()
+            del self.playlists[name]
+            self.save_json("playlists.json", self.playlists)
+            self.refresh_playlists_ui()
+            self.list_pl_songs.clear()
+            self.selected_playlist_name = None
+
+    def show_playlist_songs_menu(self, pos):
+        item = self.list_pl_songs.itemAt(pos)
+        if not item: return
+        menu = QMenu()
+        act_rem = menu.addAction("🗑️ Playlistten Çıkar")
+        act_queue = menu.addAction("➕ Queue’ya Ekle")
+        action = menu.exec_(self.list_pl_songs.mapToGlobal(pos))
+        
+        if action == act_rem:
+            self.list_pl_songs.takeItem(self.list_pl_songs.row(item))
+            self.save_current_playlist_order()
+        elif action == act_queue:
+            self.add_to_queue(item.data(Qt.UserRole))
+
+    # --- UI Refresh ---
     def refresh_queue_ui(self):
         self.btn_queue.setText(f"  Sıradakiler ({len(self.queue)})")
-
-        if self.current_data and self.current_data.get('title'):
-            t = self.current_data['title']
-            self.lbl_nowplaying.setText(f"🎧 Şimdi Çalıyor: {t[:60]}")
+        if self.current_data:
+            self.lbl_nowplaying.setText(f"🎧 Şimdi Çalıyor: {self.current_data.get('title', '')[:50]}")
         else:
             self.lbl_nowplaying.setText("🎧 Şimdi Çalıyor: -")
 
@@ -629,161 +775,54 @@ class HypeVibeNeon(QMainWindow):
             it.setIcon(qta.icon('fa5s.list', color='#bd93f9'))
             it.setData(Qt.UserRole, s)
             self.list_queue.addItem(it)
-
             if s.get('thumbnail'):
                 d = ImageLoader(s['thumbnail'], it)
                 d.image_loaded.connect(self.safe_set_item_icon)
                 self.image_threads.append(d)
                 d.start()
 
-    # --- Search right-click menu ---
-    def show_search_context_menu(self, pos):
-        item = self.list_results.itemAt(pos)
-        if not item:
-            return
-        data = item.data(Qt.UserRole) or {}
-        url = data.get('url', '')
+    def load_favs_ui(self):
+        self.list_favs.clear()
+        for s in self.favorites:
+            it = QListWidgetItem(s.get('title', ''))
+            it.setIcon(qta.icon('fa5s.heart', color='#bd93f9'))
+            it.setData(Qt.UserRole, s)
+            self.list_favs.addItem(it)
+            if s.get('thumbnail'):
+                d = ImageLoader(s['thumbnail'], it)
+                d.image_loaded.connect(self.safe_set_item_icon)
+                self.image_threads.append(d)
+                d.start()
 
-        menu = QMenu()
-        act_queue = menu.addAction("➕ Queue’ya Ekle")
-        act_fav = menu.addAction("💜 Favoriye Ekle / Çıkar")
-        act_copy = menu.addAction("🔗 Link Kopyala")
-
-        action = menu.exec_(self.list_results.mapToGlobal(pos))
-        if not action:
-            return
-
-        if action == act_queue:
-            self.add_to_queue(data)
-        elif action == act_fav:
-            self.toggle_favorite_data(data)
-        elif action == act_copy:
-            QApplication.clipboard().setText(url or "")
-
-    # --- Fav right-click menu ---
-    def show_favs_context_menu(self, pos):
-        item = self.list_favs.itemAt(pos)
-        if not item:
-            return
-        data = item.data(Qt.UserRole)
-
-        menu = QMenu()
-        act_queue = menu.addAction("➕ Queue’ya Ekle")
-        menu.addSeparator()
-        act_del = menu.addAction("🗑️ Listeden Kaldır")
-
-        action = menu.exec_(self.list_favs.mapToGlobal(pos))
-        if not action:
-            return
-
-        if action == act_queue:
-            self.add_to_queue(data)
-        elif action == act_del:
-            row = self.list_favs.row(item)
-            self.list_favs.takeItem(row)
-            self.save_favs_from_list()
-            self.btn_like.setIcon(qta.icon('fa5s.heart', color='#6272a4'))
-
-    # --- Queue right-click menu ---
-    def show_queue_context_menu(self, pos):
-        item = self.list_queue.itemAt(pos)
-        menu = QMenu()
-
-        act_play = menu.addAction("▶️ Şimdi Çal")
-        act_remove = menu.addAction("🗑️ Queue’dan Kaldır")
-        menu.addSeparator()
-        act_up = menu.addAction("⬆️ Yukarı Taşı")
-        act_down = menu.addAction("⬇️ Aşağı Taşı")
-        menu.addSeparator()
-        act_clear = menu.addAction("🧹 Queue Temizle")
-
-        action = menu.exec_(self.list_queue.mapToGlobal(pos))
-        if not action:
-            return
-
-        if action == act_clear:
-            self.clear_queue()
-            return
-
-        if not item:
-            return
-
-        row = self.list_queue.row(item)
-
-        if action == act_play:
-            self.play_queue_item(item)
-
-        elif action == act_remove:
-            if 0 <= row < len(self.queue):
-                self.queue.pop(row)
-                self.save_queue()
-                self.refresh_queue_ui()
-
-        elif action == act_up:
-            if row > 0 and row < len(self.queue):
-                self.queue[row - 1], self.queue[row] = self.queue[row], self.queue[row - 1]
-                self.save_queue()
-                self.refresh_queue_ui()
-                self.list_queue.setCurrentRow(row - 1)
-
-        elif action == act_down:
-            if 0 <= row < len(self.queue) - 1:
-                self.queue[row + 1], self.queue[row] = self.queue[row], self.queue[row + 1]
-                self.save_queue()
-                self.refresh_queue_ui()
-                self.list_queue.setCurrentRow(row + 1)
-
-    def clear_queue(self):
-        self.queue = []
-        self.save_queue()
-        self.refresh_queue_ui()
-
-    def play_queue_item(self, item):
-        row = self.list_queue.row(item)
-        if 0 <= row < len(self.queue):
-            data = self.queue.pop(row)
-            self.save_queue()
-            self.refresh_queue_ui()
-            self.load_music(data)
-
-    # --- Modlar ---
-    def toggle_shuffle(self, _checked=False):
+    # --- MODLAR ---
+    def toggle_shuffle(self):
         self.is_shuffle = not self.is_shuffle
         color = "#bd93f9" if self.is_shuffle else "#6272a4"
         self.btn_shuffle.setIcon(qta.icon('fa5s.random', color=color))
 
-    def toggle_repeat(self, _checked=False):
+    def toggle_repeat(self):
         self.is_repeat = not self.is_repeat
         color = "#bd93f9" if self.is_repeat else "#6272a4"
         self.btn_repeat.setIcon(qta.icon('fa5s.redo', color=color))
 
-    # --- Volume ---
     def _set_volume_icon(self, v):
-        if v <= 0:
-            icon = qta.icon('fa5s.volume-mute', color='#f8f8f2')
-        elif v <= 35:
-            icon = qta.icon('fa5s.volume-down', color='#f8f8f2')
-        else:
-            icon = qta.icon('fa5s.volume-up', color='#f8f8f2')
+        if v <= 0: icon = qta.icon('fa5s.volume-mute', color='#f8f8f2')
+        elif v <= 35: icon = qta.icon('fa5s.volume-down', color='#f8f8f2')
+        else: icon = qta.icon('fa5s.volume-up', color='#f8f8f2')
         self.lbl_vol_icon.setPixmap(icon.pixmap(16, 16))
 
     def set_volume(self, v):
         self._set_volume_icon(v)
         if self.player:
-            try:
-                self.player.audio_set_volume(int(v))
-            except Exception:
-                pass
+            try: self.player.audio_set_volume(int(v))
+            except Exception: pass
 
     # --- Search ---
     def do_search(self):
         q = self.inp_search.text().strip()
-        if not q:
-            return
-
+        if not q: return
         self.list_results.clear()
         self.lbl_title.setText("Aranıyor...")
-
         self.search_thread = SearchThread(q)
         self.search_thread.results_ready.connect(self.on_results)
         self.search_thread.error_occurred.connect(lambda e: self.lbl_title.setText(f"Hata: {e}"))
@@ -792,24 +831,19 @@ class HypeVibeNeon(QMainWindow):
     def on_results(self, res):
         self.lbl_title.setText(f"{len(res)} Sonuç")
         self.image_threads.clear()
-
         for r in res:
             title = r.get('title') or r.get('id') or 'Bilinmiyor'
             url = r.get('url') or r.get('webpage_url') or r.get('id')
             thumbnail = r.get('thumbnail', '')
-
-            if not url:
-                continue
-            if len(url) == 11 and '.' not in url:
-                url = f"https://www.youtube.com/watch?v={url}"
-
+            if not url: continue
+            if len(url) == 11 and '.' not in url: url = f"https://www.youtube.com/watch?v={url}"
+            
             data = {'title': title, 'url': url, 'thumbnail': thumbnail}
-
             it = QListWidgetItem(title)
             it.setIcon(qta.icon('fa5s.music', color='#bd93f9'))
             it.setData(Qt.UserRole, data)
             self.list_results.addItem(it)
-
+            
             if self.is_in_favs(url):
                 self.apply_fav_marker_to_search_item(it, True, title)
 
@@ -819,161 +853,115 @@ class HypeVibeNeon(QMainWindow):
                 self.image_threads.append(d)
                 d.start()
 
-    # --- Play item ---
+    # --- Play ---
     def play_item(self, item, src):
         if src == 'search':
-            self.current_playlist = [self.list_results.item(i).data(Qt.UserRole) for i in range(self.list_results.count())]
+            self.current_playlist = self.get_list_data(self.list_results)
             self.current_index = self.list_results.row(item)
-        else:
-            self.current_playlist = [self.list_favs.item(i).data(Qt.UserRole) for i in range(self.list_favs.count())]
+        elif src == 'fav':
+            self.current_playlist = self.get_list_data(self.list_favs)
             self.current_index = self.list_favs.row(item)
+        elif src == 'playlist':
+            self.current_playlist = self.get_list_data(self.list_pl_songs)
+            self.current_index = self.list_pl_songs.row(item)
 
         self.load_music(item.data(Qt.UserRole))
+
+    def play_queue_item(self, item):
+        row = self.list_queue.row(item)
+        if 0 <= row < len(self.queue):
+            data = self.queue.pop(row)
+            self.save_json("queue.json", self.queue)
+            self.refresh_queue_ui()
+            self.load_music(data)
 
     def load_music(self, data):
         self.current_data = data
         self.lbl_title.setText("Yükleniyor...")
         self.lbl_artist.setText(data.get('title', ''))
-
+        
         is_fav = self.is_in_favs(data.get('url', ''))
         self.btn_like.setIcon(qta.icon('fa5s.heart', color='#ff5555' if is_fav else '#6272a4'))
-
         self.refresh_queue_ui()
 
-        if not self.instance or not self.player:
-            QMessageBox.warning(self, "Hata", "VLC başlatılamadı. VLC kurulu mu?")
-            return
-
+        if not self.instance or not self.player: return
+        
         self.audio_thread = AudioThread(data['url'], data.get('title', ''))
         self.audio_thread.url_ready.connect(self.start_vlc)
-        self.audio_thread.error_occurred.connect(lambda e: QMessageBox.warning(self, "Hata", f"Hata: {e}"))
+        self.audio_thread.error_occurred.connect(lambda e: QMessageBox.warning(self, "Bağlantı Hatası", f"{e}"))
         self.audio_thread.start()
 
     def start_vlc(self, url, title):
-        if not self.instance or not self.player:
-            return
-
+        if not self.player: return
         m = self.instance.media_new(url)
         self.player.set_media(m)
         self.player.play()
-
-        try:
-            self.player.audio_set_volume(int(self.slider_vol.value()))
-        except Exception:
-            pass
-
-        self.lbl_title.setText(title[:25] + "..." if len(title) > 25 else title)
+        self.lbl_title.setText(title[:40])
         self.btn_play.setIcon(qta.icon('fa5s.pause-circle', color='#bd93f9'))
-
+        
         if self.current_data and self.current_data.get('thumbnail'):
             d = ImageLoader(self.current_data['thumbnail'], None)
             d.image_loaded.connect(self.safe_set_cover_pixmap)
             self.image_threads.append(d)
             d.start()
 
-        self.refresh_queue_ui()
+    def toggle_play(self):
+        if not self.player: return
+        if self.player.is_playing():
+            self.player.pause()
+            self.btn_play.setIcon(qta.icon('fa5s.play-circle', color='#bd93f9'))
+        else:
+            self.player.play()
+            self.btn_play.setIcon(qta.icon('fa5s.pause-circle', color='#bd93f9'))
 
-    def toggle_play(self, _checked=False):
-        if not self.player:
-            return
-        try:
-            if self.player.is_playing():
-                self.player.pause()
-                self.btn_play.setIcon(qta.icon('fa5s.play-circle', color='#bd93f9'))
-            else:
-                self.player.play()
-                self.btn_play.setIcon(qta.icon('fa5s.pause-circle', color='#bd93f9'))
-        except Exception:
-            pass
-
-    def stop_ui(self):
-        self.btn_play.setIcon(qta.icon('fa5s.play-circle', color='#bd93f9'))
-
-    def play_next(self, _checked=False, auto=False):
+    def play_next(self, auto=False):
         if self.queue:
             nxt = self.queue.pop(0)
-            self.save_queue()
+            self.save_json("queue.json", self.queue)
             self.refresh_queue_ui()
             self.load_music(nxt)
             return
 
-        if not self.current_playlist:
-            if auto:
-                self.stop_ui()
-            return
+        if not self.current_playlist: return
 
         if self.is_shuffle:
             self.current_index = random.randint(0, len(self.current_playlist) - 1)
-            self.load_music(self.current_playlist[self.current_index])
-            return
-
-        if self.current_index < len(self.current_playlist) - 1:
-            self.current_index += 1
-            self.load_music(self.current_playlist[self.current_index])
         else:
-            if self.is_repeat:
-                self.current_index = 0
-                self.load_music(self.current_playlist[self.current_index])
+            if self.current_index < len(self.current_playlist) - 1:
+                self.current_index += 1
             else:
-                if auto:
-                    self.stop_ui()
+                if self.is_repeat: self.current_index = 0
+                else: return
 
-    def play_prev(self, _checked=False):
-        if not self.current_playlist:
-            return
+        self.load_music(self.current_playlist[self.current_index])
 
-        if self.is_shuffle:
-            self.current_index = random.randint(0, len(self.current_playlist) - 1)
-            self.load_music(self.current_playlist[self.current_index])
-            return
-
+    def play_prev(self):
+        if not self.current_playlist: return
         if self.current_index > 0:
             self.current_index -= 1
             self.load_music(self.current_playlist[self.current_index])
 
     def seek_audio(self):
-        if not self.player:
-            return
-        try:
-            length = self.player.get_length()
-            if length and length > 0:
-                self.player.set_time(int(length * (self.slider.value() / 100)))
-        except Exception:
-            pass
+        if not self.player: return
+        length = self.player.get_length()
+        if length > 0: self.player.set_time(int(length * (self.slider.value() / 100)))
 
     def update_slider(self):
-        if not self.player:
-            return
-        try:
-            l = self.player.get_length()
-            c = self.player.get_time()
-            if l and l > 0 and c >= 0:
-                self.slider.setValue(int((c / l) * 100))
-                self.lbl_curr.setText(f"{c // 60000:02}:{(c // 1000) % 60:02}")
-                self.lbl_total.setText(f"{l // 60000:02}:{(l // 1000) % 60:02}")
-        except Exception:
-            pass
+        if not self.player or not self.player.is_playing(): return
+        l = self.player.get_length()
+        c = self.player.get_time()
+        if l > 0:
+            self.slider.setValue(int((c / l) * 100))
+            self.lbl_curr.setText(f"{c // 60000:02}:{(c // 1000) % 60:02}")
+            self.lbl_total.setText(f"{l // 60000:02}:{(l // 1000) % 60:02}")
 
-    # --- Like button (current) ---
-    def add_fav(self, _checked=False):
-        if not self.current_data:
-            return
-        self.toggle_favorite_data(self.current_data)
+    def add_fav(self):
+        if self.current_data: self.toggle_favorite_data(self.current_data)
 
-    # --- load fav ui ---
-    def load_favs_ui(self):
-        self.list_favs.clear()
-        for s in self.favorites:
-            it = QListWidgetItem(s.get('title', ''))
-            it.setIcon(qta.icon('fa5s.heart', color='#bd93f9'))
-            it.setData(Qt.UserRole, s)
-            self.list_favs.addItem(it)
-
-            if s.get('thumbnail'):
-                d = ImageLoader(s['thumbnail'], it)
-                d.image_loaded.connect(self.safe_set_item_icon)
-                self.image_threads.append(d)
-                d.start()
+    def clear_queue(self):
+        self.queue = []
+        self.save_json("queue.json", self.queue)
+        self.refresh_queue_ui()
 
 
 if __name__ == "__main__":
